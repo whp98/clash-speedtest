@@ -3,6 +3,10 @@ package speedtester
 import (
 	"context"
 	"fmt"
+	"github.com/metacubex/mihomo/adapter"
+	"github.com/metacubex/mihomo/adapter/provider"
+	"github.com/metacubex/mihomo/log"
+	"gopkg.in/yaml.v3"
 	"io"
 	"math"
 	"net"
@@ -14,11 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/metacubex/mihomo/adapter"
-	"github.com/metacubex/mihomo/adapter/provider"
 	"github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/log"
-	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
@@ -73,103 +73,201 @@ func (st *SpeedTester) LoadProxies(stashCompatible bool) (map[string]*CProxy, er
 	st.blockedNodeCount = 0
 
 	for _, configPath := range strings.Split(st.config.ConfigPaths, ",") {
+		configPath = strings.TrimSpace(configPath)
+		if configPath == "" {
+			continue
+		}
+
 		var body []byte
 		var err error
+
+		// 获取配置内容
 		if strings.HasPrefix(configPath, "http") {
 			var resp *http.Response
 			resp, err = http.Get(configPath)
 			if err != nil {
-				log.Warnln("failed to fetch config: %s", err)
+				log.Warnln("Failed to fetch config from %s: %v", configPath, err)
 				continue
 			}
+			defer resp.Body.Close()
 			body, err = io.ReadAll(resp.Body)
+			if err != nil {
+				log.Warnln("Failed to read config from %s: %v", configPath, err)
+				continue
+			}
 		} else {
 			body, err = os.ReadFile(configPath)
-		}
-		if err != nil {
-			log.Warnln("failed to read config: %s", err)
-			continue
+			if err != nil {
+				log.Warnln("Failed to read config file %s: %v", configPath, err)
+				continue
+			}
 		}
 
+		// 解析配置
 		rawCfg := &RawConfig{
 			Proxies: []map[string]any{},
 		}
 		if err := yaml.Unmarshal(body, rawCfg); err != nil {
-			return nil, err
+			log.Warnln("Failed to parse config %s: %v", configPath, err)
+			continue
 		}
+
 		proxies := make(map[string]*CProxy)
 		proxiesConfig := rawCfg.Proxies
 		providersConfig := rawCfg.Providers
 
+		// 加载直接定义的代理
 		for i, config := range proxiesConfig {
 			proxy, err := adapter.ParseProxy(config)
 			if err != nil {
-				return nil, fmt.Errorf("proxy %d: %w", i, err)
-			}
-
-			if _, exist := proxies[proxy.Name()]; exist {
-				return nil, fmt.Errorf("proxy %s is the duplicate name", proxy.Name())
-			}
-			proxies[proxy.Name()] = &CProxy{Proxy: proxy, Config: config}
-		}
-		for name, config := range providersConfig {
-			if name == provider.ReservedName {
-				return nil, fmt.Errorf("can not defined a provider called `%s`", provider.ReservedName)
-			}
-			pd, err := provider.ParseProxyProvider(name, config)
-			if err != nil {
-				return nil, fmt.Errorf("parse proxy provider %s error: %w", name, err)
-			}
-			if err := pd.Initial(); err != nil {
-				return nil, fmt.Errorf("initial proxy provider %s error: %w", pd.Name(), err)
-			}
-
-			resp, err := http.Get(config["url"].(string))
-			if err != nil {
-				log.Warnln("failed to fetch config: %s", err)
+				log.Debugln("Skip proxy %d in %s: %v", i, configPath, err)
 				continue
 			}
-			body, err = io.ReadAll(resp.Body)
-			if err != nil {
-				return nil, err
+
+			// 处理重名
+			proxyName := proxy.Name()
+			if _, exist := proxies[proxyName]; exist {
+				counter := 1
+				for {
+					newName := fmt.Sprintf("%s-重名%d", proxyName, counter)
+					if _, exist := proxies[newName]; !exist {
+						proxyName = newName
+						break
+					}
+					counter++
+				}
+				log.Debugln("Renamed duplicate proxy: %s -> %s", proxy.Name(), proxyName)
 			}
+			proxies[proxyName] = &CProxy{Proxy: proxy, Config: config}
+		}
+
+		// 加载 provider 中的代理
+		for name, config := range providersConfig {
+			if name == provider.ReservedName {
+				log.Warnln("Skip reserved provider name: %s", provider.ReservedName)
+				continue
+			}
+
+			pd, err := provider.ParseProxyProvider(name, config)
+			if err != nil {
+				log.Warnln("Failed to parse provider %s: %v", name, err)
+				continue
+			}
+
+			if err := pd.Initial(); err != nil {
+				log.Warnln("Failed to initialize provider %s: %v", name, err)
+				continue
+			}
+
+			// 获取 provider 的配置
+			urlStr, ok := config["url"].(string)
+			if !ok {
+				log.Warnln("Provider %s has no valid URL", name)
+				continue
+			}
+
+			resp, err := http.Get(urlStr)
+			if err != nil {
+				log.Warnln("Failed to fetch provider %s from %s: %v", name, urlStr, err)
+				continue
+			}
+
+			providerBody, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				log.Warnln("Failed to read provider %s: %v", name, err)
+				continue
+			}
+
 			pdRawCfg := &RawConfig{
 				Proxies: []map[string]any{},
 			}
-			if err := yaml.Unmarshal(body, pdRawCfg); err != nil {
-				return nil, err
+			if err := yaml.Unmarshal(providerBody, pdRawCfg); err != nil {
+				log.Warnln("Failed to parse provider %s config: %v", name, err)
+				continue
 			}
+
+			// 建立 provider 代理配置映射
 			pdProxies := make(map[string]map[string]any)
 			for _, pdProxy := range pdRawCfg.Proxies {
-				pdProxies[pdProxy["name"].(string)] = pdProxy
+				if proxyName, ok := pdProxy["name"].(string); ok {
+					pdProxies[proxyName] = pdProxy
+				}
 			}
+
+			// 添加 provider 中的代理
 			for _, proxy := range pd.Proxies() {
-				proxies[fmt.Sprintf("[%s] %s", name, proxy.Name())] = &CProxy{
-					Proxy:  proxy,
-					Config: pdProxies[proxy.Name()],
+				proxyName := fmt.Sprintf("[%s] %s", name, proxy.Name())
+				if proxyConfig, ok := pdProxies[proxy.Name()]; ok {
+					// 处理重名
+					finalName := proxyName
+					if _, exist := proxies[finalName]; exist {
+						counter := 1
+						for {
+							newName := fmt.Sprintf("%s-重名%d", proxyName, counter)
+							if _, exist := proxies[newName]; !exist {
+								finalName = newName
+								break
+							}
+							counter++
+						}
+						log.Debugln("Renamed duplicate proxy: %s -> %s", proxyName, finalName)
+					}
+					proxies[finalName] = &CProxy{
+						Proxy:  proxy,
+						Config: proxyConfig,
+					}
+				} else {
+					log.Debugln("No config found for proxy %s in provider %s", proxy.Name(), name)
 				}
 			}
 		}
+
+		// 过滤和合并代理
 		for k, p := range proxies {
+			// 检查代理类型
 			switch p.Type() {
 			case constant.Shadowsocks, constant.ShadowsocksR, constant.Snell, constant.Socks5, constant.Http,
 				constant.Vmess, constant.Vless, constant.Trojan, constant.Hysteria, constant.Hysteria2,
 				constant.WireGuard, constant.Tuic, constant.Ssh, constant.Mieru, constant.AnyTLS:
+				// 支持的类型
 			default:
+				log.Debugln("Skip unsupported proxy type %s: %s", p.Type(), k)
 				continue
 			}
+
+			// 修复 IPv6 映射地址
 			if server, ok := p.Config["server"]; ok {
 				p.Config["server"] = convertMappedIPv6ToIPv4(server.(string))
 			}
+
+			// Stash 兼容性检查
 			if stashCompatible && !isStashCompatible(p) {
+				log.Debugln("Skip non-Stash-compatible proxy: %s", k)
 				continue
 			}
-			if _, ok := allProxies[k]; !ok {
-				allProxies[k] = p
+
+			// 避免重复
+			finalName := k
+			if _, ok := allProxies[finalName]; ok {
+				counter := 1
+				for {
+					newName := fmt.Sprintf("%s-重名%d", k, counter)
+					if _, ok := allProxies[newName]; !ok {
+						finalName = newName
+						break
+					}
+					counter++
+				}
+				log.Debugln("Renamed duplicate proxy across configs: %s -> %s", k, finalName)
 			}
+			allProxies[finalName] = p
 		}
 	}
 
+	log.Infoln("Loaded %d proxies from all configs", len(allProxies))
+
+	// 应用过滤规则
 	filterRegexp := regexp.MustCompile(st.config.FilterRegex)
 	var blockKeywords []string
 	if st.config.BlockRegex != "" {
@@ -183,12 +281,15 @@ func (st *SpeedTester) LoadProxies(stashCompatible bool) (map[string]*CProxy, er
 
 	filteredProxies := make(map[string]*CProxy)
 	for name := range allProxies {
+		// 检查黑名单
 		shouldBlock := false
 		if len(blockKeywords) > 0 {
 			lowerName := strings.ToLower(name)
 			for _, keyword := range blockKeywords {
 				if strings.Contains(lowerName, keyword) {
 					shouldBlock = true
+					st.blockedNodes = append(st.blockedNodes, name)
+					st.blockedNodeCount++
 					break
 				}
 			}
@@ -197,10 +298,20 @@ func (st *SpeedTester) LoadProxies(stashCompatible bool) (map[string]*CProxy, er
 		if shouldBlock {
 			continue
 		}
+
+		// 检查白名单（过滤正则）
 		if filterRegexp.MatchString(name) {
 			filteredProxies[name] = allProxies[name]
 		}
 	}
+
+	log.Infoln("Filtered to %d proxies (blocked: %d)", len(filteredProxies), st.blockedNodeCount)
+
+	// 如果没有加载到任何代理，返回错误
+	if len(filteredProxies) == 0 {
+		return nil, fmt.Errorf("no valid proxies loaded from configs")
+	}
+
 	return filteredProxies, nil
 }
 
@@ -353,7 +464,6 @@ func formatSpeed(bytesPerSecond float64) string {
 	}
 	return fmt.Sprintf("%.2f%s", speed, units[unit])
 }
-
 func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 	result := &Result{
 		ProxyName:   name,
@@ -361,24 +471,38 @@ func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 		ProxyConfig: proxy.Config,
 	}
 
-	// 1. 首先进行延迟测试
-	latencyResult := st.testLatency(proxy, st.config.MaxLatency)
-	result.Latency = latencyResult.avgLatency
+	// 尝试创建客户端并发起请求，任何错误都视为失败
+	client := st.createClient(proxy, st.config.MaxLatency)
+
+	// 快速连接测试 - 直接请求一个小数据
+	start := time.Now()
+	resp, err := client.Get(fmt.Sprintf("%s/__down?bytes=0", st.config.ServerURL))
+	if err != nil {
+		// 连接失败，返回全零结果
+		return result
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		// HTTP 状态码异常，返回全零结果
+		return result
+	}
+
+	// 记录基本延迟
+	result.Latency = time.Since(start)
+
+	// FastMode 下只测试连通性就返回
 	if st.config.FastMode {
 		return result
-	} else {
-		result.Jitter = latencyResult.jitter
-		result.PacketLoss = latencyResult.packetLoss
 	}
 
-	if result.PacketLoss == 100 || result.Latency > st.config.MaxLatency {
+	// 检查延迟是否超限
+	if result.Latency > st.config.MaxLatency {
 		return result
 	}
 
-	// 2. 并发进行下载和上传测试
-
+	// 2. 并发进行下载测试
 	var wg sync.WaitGroup
-
 	var totalDownloadBytes, totalUploadBytes int64
 	var totalDownloadTime, totalUploadTime time.Duration
 	var downloadCount, uploadCount int
@@ -411,11 +535,13 @@ func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 			result.DownloadSpeed = float64(totalDownloadBytes) / result.DownloadTime.Seconds()
 		}
 
+		// 下载速度不达标，返回（此时已有部分数据）
 		if result.DownloadSpeed < st.config.MinDownloadSpeed {
 			return result
 		}
 	}
 
+	// 3. 并发进行上传测试
 	uploadChunkSize := st.config.UploadSize / st.config.Concurrent
 	if uploadChunkSize > 0 {
 		uploadResults := make(chan *downloadResult, st.config.Concurrent)
@@ -443,10 +569,6 @@ func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 			result.UploadTime = totalUploadTime / time.Duration(uploadCount)
 			result.UploadSpeed = float64(totalUploadBytes) / result.UploadTime.Seconds()
 		}
-
-		if result.UploadSpeed < st.config.MinUploadSpeed {
-			return result
-		}
 	}
 
 	return result
@@ -458,29 +580,35 @@ type latencyResult struct {
 	packetLoss float64
 }
 
-func (st *SpeedTester) testLatency(proxy constant.Proxy, minLatency time.Duration) *latencyResult {
-	client := st.createClient(proxy, minLatency)
-	latencies := make([]time.Duration, 0, 6)
-	failedPings := 0
+// 可以删除或简化 testLatency 函数，因为不再需要复杂的延迟统计
+// 如果其他地方还在用，可以保留但简化实现：
+func (st *SpeedTester) testLatency(proxy constant.Proxy, timeout time.Duration) *latencyResult {
+	client := st.createClient(proxy, timeout)
 
-	for i := 0; i < 6; i++ {
-		time.Sleep(100 * time.Millisecond)
-
-		start := time.Now()
-		resp, err := client.Get(fmt.Sprintf("%s/__down?bytes=0", st.config.ServerURL))
-		if err != nil {
-			failedPings++
-			continue
+	start := time.Now()
+	resp, err := client.Get(fmt.Sprintf("%s/__down?bytes=0", st.config.ServerURL))
+	if err != nil {
+		return &latencyResult{
+			avgLatency: 0,
+			jitter:     0,
+			packetLoss: 100.0,
 		}
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			latencies = append(latencies, time.Since(start))
-		} else {
-			failedPings++
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return &latencyResult{
+			avgLatency: 0,
+			jitter:     0,
+			packetLoss: 100.0,
 		}
 	}
 
-	return calculateLatencyStats(latencies, failedPings)
+	return &latencyResult{
+		avgLatency: time.Since(start),
+		jitter:     0,
+		packetLoss: 0,
+	}
 }
 
 type downloadResult struct {

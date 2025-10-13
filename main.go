@@ -238,13 +238,17 @@ func saveConfig(results []*speedtester.Result) error {
 		if *maxLatency > 0 && result.Latency > *maxLatency {
 			continue
 		}
-		if *downloadSize > 0 && *minDownloadSpeed > 0 && result.DownloadSpeed < *minDownloadSpeed*1024*1024 {
+		if result.Latency == 0 {
 			continue
 		}
-		if *uploadSize > 0 && *minUploadSpeed > 0 && result.UploadSpeed < *minUploadSpeed*1024*1024 {
-			continue
+		if !*fastMode {
+			if *downloadSize > 0 && *minDownloadSpeed > 0 && result.DownloadSpeed < *minDownloadSpeed*1024*1024 {
+				continue
+			}
+			if *uploadSize > 0 && *minUploadSpeed > 0 && result.UploadSpeed < *minUploadSpeed*1024*1024 {
+				continue
+			}
 		}
-
 		proxyConfig := result.ProxyConfig
 		if *renameNodes {
 			location, err := getIPLocation(proxyConfig["server"].(string))
@@ -252,7 +256,11 @@ func saveConfig(results []*speedtester.Result) error {
 				proxies = append(proxies, proxyConfig)
 				continue
 			}
-			proxyConfig["name"] = generateNodeName(location.CountryCode, result.DownloadSpeed)
+			if *fastMode {
+				proxyConfig["name"] = fmt.Sprintf("%s|%s|%dms", proxyConfig["name"], location.CountryCode, result.Latency.Milliseconds())
+			} else {
+				proxyConfig["name"] = generateNodeName(location.CountryCode, result.DownloadSpeed)
+			}
 		}
 		proxies = append(proxies, proxyConfig)
 	}
@@ -260,11 +268,14 @@ func saveConfig(results []*speedtester.Result) error {
 	config := &speedtester.RawConfig{
 		Proxies: proxies,
 	}
+	if len(proxies) == 0 {
+		log.Warnln("No proxy available,No output!")
+		return nil
+	}
 	yamlData, err := yaml.Marshal(config)
 	if err != nil {
 		return err
 	}
-
 	return os.WriteFile(*outputPath, yamlData, 0o644)
 }
 
