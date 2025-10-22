@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/google/uuid"
 	"io"
 	"net/http"
 	"os"
@@ -257,7 +258,12 @@ func saveConfig(results []*speedtester.Result) error {
 				continue
 			}
 			if *fastMode {
-				proxyConfig["name"] = fmt.Sprintf("%s|%s|%dms", proxyConfig["name"], location.CountryCode, result.Latency.Milliseconds())
+				newUUID := uuid.New().String()
+				proxyConfig["name"] = fmt.Sprintf("%s|%s|%s|%dms|%s", countryNames[location.CountryCode],
+					location.CountryCode,
+					countryFlags[location.CountryCode],
+					result.Latency.Milliseconds(),
+					newUUID)
 			} else {
 				proxyConfig["name"] = generateNodeName(location.CountryCode, result.DownloadSpeed)
 			}
@@ -299,6 +305,22 @@ var countryFlags = map[string]string{
 	"PR": "🇵🇷", "VI": "🇻🇮", "GU": "🇬🇺", "AS": "🇦🇸", "MP": "🇲🇵", "PW": "🇵🇼", "FM": "🇫🇲", "MH": "🇲🇭",
 	"KI": "🇰🇮", "TV": "🇹🇻", "NR": "🇳🇷", "WS": "🇼🇸", "TO": "🇹🇴", "FJ": "🇫🇯", "VU": "🇻🇺", "SB": "🇸🇧",
 	"PG": "🇵🇬", "NC": "🇳🇨", "PF": "🇵🇫", "WF": "🇼🇫", "CK": "🇨🇰", "NU": "🇳🇺", "TK": "🇹🇰", "SC": "🇸🇨",
+}
+var countryNames = map[string]string{
+	"US": "美国", "CN": "中国", "GB": "英国", "UK": "英国", "JP": "日本", "DE": "德国", "FR": "法国", "RU": "俄罗斯",
+	"SG": "新加坡", "HK": "香港", "TW": "台湾", "KR": "韩国", "CA": "加拿大", "AU": "澳大利亚", "NL": "荷兰", "IT": "意大利",
+	"ES": "西班牙", "SE": "瑞典", "NO": "挪威", "DK": "丹麦", "FI": "芬兰", "CH": "瑞士", "AT": "奥地利", "BE": "比利时",
+	"BR": "巴西", "IN": "印度", "TH": "泰国", "MY": "马来西亚", "VN": "越南", "PH": "菲律宾", "ID": "印度尼西亚", "UA": "乌克兰",
+	"TR": "土耳其", "IL": "以色列", "AE": "阿联酋", "SA": "沙特阿拉伯", "EG": "埃及", "ZA": "南非", "NG": "尼日利亚", "KE": "肯尼亚",
+	"RO": "罗马尼亚", "PL": "波兰", "CZ": "捷克", "HU": "匈牙利", "BG": "保加利亚", "HR": "克罗地亚", "SI": "斯洛文尼亚", "SK": "斯洛伐克",
+	"LT": "立陶宛", "LV": "拉脱维亚", "EE": "爱沙尼亚", "PT": "葡萄牙", "GR": "希腊", "IE": "爱尔兰", "LU": "卢森堡", "MT": "马耳他",
+	"CY": "塞浦路斯", "IS": "冰岛", "MX": "墨西哥", "AR": "阿根廷", "CL": "智利", "CO": "哥伦比亚", "PE": "秘鲁", "VE": "委内瑞拉",
+	"EC": "厄瓜多尔", "UY": "乌拉圭", "PY": "巴拉圭", "BO": "玻利维亚", "CR": "哥斯达黎加", "PA": "巴拿马", "GT": "危地马拉", "HN": "洪都拉斯",
+	"SV": "萨尔瓦多", "NI": "尼加拉瓜", "BZ": "伯利兹", "JM": "牙买加", "TT": "特立尼达和多巴哥", "BB": "巴巴多斯", "GD": "格林纳达", "LC": "圣卢西亚",
+	"VC": "圣文森特和格林纳丁斯", "AG": "安提瓜和巴布达", "DM": "多米尼克", "KN": "圣基茨和尼维斯", "BS": "巴哈马", "CU": "古巴", "DO": "多米尼加", "HT": "海地",
+	"PR": "波多黎各", "VI": "美属维尔京群岛", "GU": "关岛", "AS": "美属萨摩亚", "MP": "北马里亚纳群岛", "PW": "帕劳", "FM": "密克罗尼西亚", "MH": "马绍尔群岛",
+	"KI": "基里巴斯", "TV": "图瓦卢", "NR": "瑙鲁", "WS": "萨摩亚", "TO": "汤加", "FJ": "斐济", "VU": "瓦努阿图", "SB": "所罗门群岛",
+	"PG": "巴布亚新几内亚", "NC": "新喀里多尼亚", "PF": "法属波利尼西亚", "WF": "瓦利斯和富图纳", "CK": "库克群岛", "NU": "纽埃", "TK": "托克劳", "SC": "塞舌尔",
 }
 
 func getIPLocation(ip string) (*IPLocation, error) {

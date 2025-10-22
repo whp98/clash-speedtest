@@ -403,9 +403,49 @@ func isStashCompatible(proxy *CProxy) bool {
 }
 
 func (st *SpeedTester) TestProxies(proxies map[string]*CProxy, tester func(result *Result)) {
-	for name, proxy := range proxies {
-		tester(st.testProxy(name, proxy))
+	if st.config.FastMode {
+		// 快速模式：并发测试
+		threadNum := st.config.Concurrent
+		if threadNum <= 0 {
+			threadNum = 10 // 默认并发数
+		}
+
+		// 使用 channel 控制并发数量
+		semaphore := make(chan struct{}, threadNum)
+		resultChan := make(chan *Result, len(proxies)) // 缓冲 channel 存储结果
+		var wg sync.WaitGroup
+
+		for name, proxy := range proxies {
+			wg.Add(1)
+			go func(n string, p *CProxy) {
+				defer wg.Done()
+				semaphore <- struct{}{}        // 获取信号量（进入并发控制）
+				defer func() { <-semaphore }() // 释放信号量
+
+				result := st.testProxy(n, p)
+				resultChan <- result
+			}(name, proxy)
+		}
+
+		// 等待所有 goroutine 完成
+		go func() {
+			wg.Wait()
+			close(resultChan)
+		}()
+
+		// 读取结果并调用 tester 回调
+		for result := range resultChan {
+			tester(result)
+		}
+
+	} else {
+		// 普通模式：串行测试
+		for name, proxy := range proxies {
+			result := st.testProxy(name, proxy)
+			tester(result)
+		}
 	}
+
 }
 
 type testJob struct {
@@ -475,8 +515,12 @@ func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 	client := st.createClient(proxy, st.config.MaxLatency)
 
 	// 快速连接测试 - 直接请求一个小数据
+	url := fmt.Sprintf("%s/__down?bytes=0", st.config.ServerURL)
+	if st.config.FastMode {
+		url = "https://www.google.com/generate_204"
+	}
 	start := time.Now()
-	resp, err := client.Get(fmt.Sprintf("%s/__down?bytes=0", st.config.ServerURL))
+	resp, err := client.Get(url)
 	if err != nil {
 		// 连接失败，返回全零结果
 		return result
