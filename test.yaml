@@ -1,0 +1,5 @@
+proxies:
+- name: "本地10800-test"
+  server: "127.0.0.1"
+  type: "socks5"
+  port: 10800

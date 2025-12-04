@@ -1,18 +1,17 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/google/uuid"
-	"io"
-	"net/http"
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/faceair/clash-speedtest/speedtester"
+	"github.com/faceair/clash-speedtest/webserver"
+	"github.com/google/uuid"
 	"github.com/metacubex/mihomo/log"
 	"github.com/olekukonko/tablewriter"
 	"github.com/schollz/progressbar/v3"
@@ -35,6 +34,8 @@ var (
 	minUploadSpeed    = flag.Float64("min-upload-speed", 2, "filter upload speed less than this value(unit: MB/s)")
 	renameNodes       = flag.Bool("rename", false, "rename nodes with IP location and speed")
 	fastMode          = flag.Bool("fast", false, "fast mode, only test latency")
+	webMode           = flag.Bool("web", false, "enable web server mode")
+	webPort           = flag.Int("port", 8080, "web server port (only used in web mode)")
 )
 
 const (
@@ -48,6 +49,20 @@ func main() {
 	flag.Parse()
 	log.SetLevel(log.SILENT)
 
+	// Web 模式
+	if *webMode {
+		server, err := webserver.New(*webPort)
+		if err != nil {
+			log.Fatalln("初始化 Web 服务器失败: %v", err)
+		}
+
+		if err := server.Start(); err != nil {
+			log.Fatalln("启动 Web 服务器失败: %v", err)
+		}
+		return
+	}
+
+	// CLI 模式
 	if *configPathsConfig == "" {
 		log.Fatalln("please specify the configuration file")
 	}
@@ -87,7 +102,7 @@ func main() {
 	printResults(results)
 
 	if *outputPath != "" {
-		err = saveConfig(results)
+		err = saveConfig(results, speedTester)
 		if err != nil {
 			log.Fatalln("save config file failed: %v", err)
 		}
@@ -119,7 +134,6 @@ func printResults(results []*speedtester.Result) {
 		}
 	}
 	table.SetHeader(headers)
-
 	table.SetAutoWrapText(false)
 	table.SetAutoFormatHeaders(true)
 	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
@@ -158,7 +172,6 @@ func printResults(results []*speedtester.Result) {
 		} else {
 			latencyStr = colorRed + latencyStr + colorReset
 		}
-
 		jitterStr := result.FormatJitter()
 		if result.Jitter > 0 {
 			if result.Jitter < 800*time.Millisecond {
@@ -171,7 +184,6 @@ func printResults(results []*speedtester.Result) {
 		} else {
 			jitterStr = colorRed + jitterStr + colorReset
 		}
-
 		// 丢包率颜色
 		packetLossStr := result.FormatPacketLoss()
 		if result.PacketLoss < 10 {
@@ -181,7 +193,6 @@ func printResults(results []*speedtester.Result) {
 		} else {
 			packetLossStr = colorRed + packetLossStr + colorReset
 		}
-
 		// 下载速度颜色 (以MB/s为单位判断)
 		downloadSpeed := result.DownloadSpeed / (1024 * 1024)
 		downloadSpeedStr := result.FormatDownloadSpeed()
@@ -192,7 +203,6 @@ func printResults(results []*speedtester.Result) {
 		} else {
 			downloadSpeedStr = colorRed + downloadSpeedStr + colorReset
 		}
-
 		// 上传速度颜色
 		uploadSpeed := result.UploadSpeed / (1024 * 1024)
 		uploadSpeedStr := result.FormatUploadSpeed()
@@ -203,7 +213,6 @@ func printResults(results []*speedtester.Result) {
 		} else {
 			uploadSpeedStr = colorRed + uploadSpeedStr + colorReset
 		}
-
 		var row []string
 		if *fastMode {
 			row = []string{
@@ -227,14 +236,16 @@ func printResults(results []*speedtester.Result) {
 
 		table.Append(row)
 	}
-
 	fmt.Println()
 	table.Render()
 	fmt.Println()
 }
 
-func saveConfig(results []*speedtester.Result) error {
+func saveConfig(results []*speedtester.Result, speedTester *speedtester.SpeedTester) error {
 	proxies := make([]map[string]any, 0)
+
+	// Filter results first
+	var validResults []*speedtester.Result
 	for _, result := range results {
 		if *maxLatency > 0 && result.Latency > *maxLatency {
 			continue
@@ -250,25 +261,41 @@ func saveConfig(results []*speedtester.Result) error {
 				continue
 			}
 		}
-		proxyConfig := result.ProxyConfig
-		if *renameNodes {
-			location, err := getIPLocation(proxyConfig["server"].(string))
-			if err != nil || location.CountryCode == "" {
-				proxies = append(proxies, proxyConfig)
-				continue
-			}
-			if *fastMode {
-				newUUID := uuid.New().String()
-				proxyConfig["name"] = fmt.Sprintf("%s|%s|%s|%dms|%s", countryNames[location.CountryCode],
-					location.CountryCode,
-					countryFlags[location.CountryCode],
-					result.Latency.Milliseconds(),
-					newUUID)
-			} else {
-				proxyConfig["name"] = generateNodeName(location.CountryCode, result.DownloadSpeed)
-			}
+		validResults = append(validResults, result)
+	}
+	if *renameNodes {
+		var wg sync.WaitGroup
+		semaphore := make(chan struct{}, *concurrent)
+		for _, result := range validResults {
+			wg.Add(1)
+			go func(r *speedtester.Result) {
+				defer wg.Done()
+				semaphore <- struct{}{}
+				defer func() { <-semaphore }()
+				location, err := speedTester.GetIPLocation(r.Proxy)
+				countryCode := "UNKNOWN"
+				if err == nil && location.CountryCode != "" {
+					countryCode = location.CountryCode
+				}
+				proxyConfig := r.ProxyConfig
+				if *fastMode {
+					newUUID := uuid.New().String()
+					proxyConfig["name"] = fmt.Sprintf("%s|%s|%s|%dms|%s",
+						countryNames[countryCode],
+						countryCode,
+						countryFlags[countryCode],
+						r.Latency.Milliseconds(),
+						newUUID)
+				} else {
+					proxyConfig["name"] = generateNodeName(countryCode, r.DownloadSpeed)
+				}
+			}(result)
 		}
-		proxies = append(proxies, proxyConfig)
+		wg.Wait()
+	}
+
+	for _, result := range validResults {
+		proxies = append(proxies, result.ProxyConfig)
 	}
 
 	config := &speedtester.RawConfig{
@@ -285,9 +312,14 @@ func saveConfig(results []*speedtester.Result) error {
 	return os.WriteFile(*outputPath, yamlData, 0o644)
 }
 
-type IPLocation struct {
-	Country     string `json:"country"`
-	CountryCode string `json:"countryCode"`
+func generateNodeName(countryCode string, downloadSpeed float64) string {
+	flag, exists := countryFlags[strings.ToUpper(countryCode)]
+	if !exists {
+		flag = "🏳️"
+	}
+
+	speedMBps := downloadSpeed / (1024 * 1024)
+	return fmt.Sprintf("%s %s | ⬇️ %.2f MB/s", flag, strings.ToUpper(countryCode), speedMBps)
 }
 
 var countryFlags = map[string]string{
@@ -305,6 +337,7 @@ var countryFlags = map[string]string{
 	"PR": "🇵🇷", "VI": "🇻🇮", "GU": "🇬🇺", "AS": "🇦🇸", "MP": "🇲🇵", "PW": "🇵🇼", "FM": "🇫🇲", "MH": "🇲🇭",
 	"KI": "🇰🇮", "TV": "🇹🇻", "NR": "🇳🇷", "WS": "🇼🇸", "TO": "🇹🇴", "FJ": "🇫🇯", "VU": "🇻🇺", "SB": "🇸🇧",
 	"PG": "🇵🇬", "NC": "🇳🇨", "PF": "🇵🇫", "WF": "🇼🇫", "CK": "🇨🇰", "NU": "🇳🇺", "TK": "🇹🇰", "SC": "🇸🇨",
+	"UNKNOWN": "🏳️",
 }
 var countryNames = map[string]string{
 	"US": "美国", "CN": "中国", "GB": "英国", "UK": "英国", "JP": "日本", "DE": "德国", "FR": "法国", "RU": "俄罗斯",
@@ -321,38 +354,5 @@ var countryNames = map[string]string{
 	"PR": "波多黎各", "VI": "美属维尔京群岛", "GU": "关岛", "AS": "美属萨摩亚", "MP": "北马里亚纳群岛", "PW": "帕劳", "FM": "密克罗尼西亚", "MH": "马绍尔群岛",
 	"KI": "基里巴斯", "TV": "图瓦卢", "NR": "瑙鲁", "WS": "萨摩亚", "TO": "汤加", "FJ": "斐济", "VU": "瓦努阿图", "SB": "所罗门群岛",
 	"PG": "巴布亚新几内亚", "NC": "新喀里多尼亚", "PF": "法属波利尼西亚", "WF": "瓦利斯和富图纳", "CK": "库克群岛", "NU": "纽埃", "TK": "托克劳", "SC": "塞舌尔",
-}
-
-func getIPLocation(ip string) (*IPLocation, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/%s?fields=country,countryCode", ip))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to get location for IP %s", ip)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var location IPLocation
-	if err := json.Unmarshal(body, &location); err != nil {
-		return nil, err
-	}
-	return &location, nil
-}
-
-func generateNodeName(countryCode string, downloadSpeed float64) string {
-	flag, exists := countryFlags[strings.ToUpper(countryCode)]
-	if !exists {
-		flag = "🏳️"
-	}
-
-	speedMBps := downloadSpeed / (1024 * 1024)
-	return fmt.Sprintf("%s %s | ⬇️ %.2f MB/s", flag, strings.ToUpper(countryCode), speedMBps)
+	"UNKNOWN": "未知",
 }

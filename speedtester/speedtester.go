@@ -2,11 +2,8 @@ package speedtester
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"github.com/metacubex/mihomo/adapter"
-	"github.com/metacubex/mihomo/adapter/provider"
-	"github.com/metacubex/mihomo/log"
-	"gopkg.in/yaml.v3"
 	"io"
 	"math"
 	"net"
@@ -17,6 +14,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/metacubex/mihomo/adapter"
+	"github.com/metacubex/mihomo/adapter/provider"
+	"github.com/metacubex/mihomo/log"
+	"gopkg.in/yaml.v3"
 
 	"github.com/metacubex/mihomo/constant"
 )
@@ -457,6 +459,7 @@ type Result struct {
 	ProxyName     string         `json:"proxy_name"`
 	ProxyType     string         `json:"proxy_type"`
 	ProxyConfig   map[string]any `json:"proxy_config"`
+	Proxy         constant.Proxy `json:"-"`
 	Latency       time.Duration  `json:"latency"`
 	Jitter        time.Duration  `json:"jitter"`
 	PacketLoss    float64        `json:"packet_loss"`
@@ -509,11 +512,11 @@ func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 		ProxyName:   name,
 		ProxyType:   proxy.Type().String(),
 		ProxyConfig: proxy.Config,
+		Proxy:       proxy,
 	}
 
 	// 尝试创建客户端并发起请求，任何错误都视为失败
 	client := st.createClient(proxy, st.config.MaxLatency)
-
 	// 快速连接测试 - 直接请求一个小数据
 	url := fmt.Sprintf("%s/__down?bytes=0", st.config.ServerURL)
 	if st.config.FastMode {
@@ -522,39 +525,39 @@ func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 	start := time.Now()
 	resp, err := client.Get(url)
 	if err != nil {
+		// 🔔 修改点：打印具体的错误原因 (err.Error())
+		//fmt.Printf("\n %s %s %s: %s", name, url, "err connection!", err.Error())
 		// 连接失败，返回全零结果
 		return result
 	}
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
+	err = resp.Body.Close()
+	if err != nil {
+		return nil
+	}
+	//fmt.Printf("\n %s %s %d", name, url, resp.StatusCode)
+	//5xx代码返回失败
+	if resp.StatusCode/100 == 5 {
 		// HTTP 状态码异常，返回全零结果
 		return result
 	}
-
 	// 记录基本延迟
 	result.Latency = time.Since(start)
-
 	// FastMode 下只测试连通性就返回
 	if st.config.FastMode {
 		return result
 	}
-
 	// 检查延迟是否超限
 	if result.Latency > st.config.MaxLatency {
 		return result
 	}
-
 	// 2. 并发进行下载测试
 	var wg sync.WaitGroup
 	var totalDownloadBytes, totalUploadBytes int64
 	var totalDownloadTime, totalUploadTime time.Duration
 	var downloadCount, uploadCount int
-
 	downloadChunkSize := st.config.DownloadSize / st.config.Concurrent
 	if downloadChunkSize > 0 {
 		downloadResults := make(chan *downloadResult, st.config.Concurrent)
-
 		for i := 0; i < st.config.Concurrent; i++ {
 			wg.Add(1)
 			go func() {
@@ -563,7 +566,6 @@ func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 			}()
 		}
 		wg.Wait()
-
 		for range st.config.Concurrent {
 			if dr := <-downloadResults; dr != nil {
 				totalDownloadBytes += dr.bytes
@@ -572,24 +574,20 @@ func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 			}
 		}
 		close(downloadResults)
-
 		if downloadCount > 0 {
 			result.DownloadSize = float64(totalDownloadBytes)
 			result.DownloadTime = totalDownloadTime / time.Duration(downloadCount)
 			result.DownloadSpeed = float64(totalDownloadBytes) / result.DownloadTime.Seconds()
 		}
-
 		// 下载速度不达标，返回（此时已有部分数据）
 		if result.DownloadSpeed < st.config.MinDownloadSpeed {
 			return result
 		}
 	}
-
 	// 3. 并发进行上传测试
 	uploadChunkSize := st.config.UploadSize / st.config.Concurrent
 	if uploadChunkSize > 0 {
 		uploadResults := make(chan *downloadResult, st.config.Concurrent)
-
 		for i := 0; i < st.config.Concurrent; i++ {
 			wg.Add(1)
 			go func() {
@@ -598,7 +596,6 @@ func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 			}()
 		}
 		wg.Wait()
-
 		for i := 0; i < st.config.Concurrent; i++ {
 			if ur := <-uploadResults; ur != nil {
 				totalUploadBytes += ur.bytes
@@ -607,14 +604,12 @@ func (st *SpeedTester) testProxy(name string, proxy *CProxy) *Result {
 			}
 		}
 		close(uploadResults)
-
 		if uploadCount > 0 {
 			result.UploadSize = float64(totalUploadBytes)
 			result.UploadTime = totalUploadTime / time.Duration(uploadCount)
 			result.UploadSpeed = float64(totalUploadBytes) / result.UploadTime.Seconds()
 		}
 	}
-
 	return result
 }
 
@@ -766,4 +761,33 @@ func convertMappedIPv6ToIPv4(server string) string {
 		return ipv4.String()
 	}
 	return server
+}
+
+type IPLocation struct {
+	Country     string `json:"country"`
+	CountryCode string `json:"countryCode"`
+}
+
+func (st *SpeedTester) GetIPLocation(proxy constant.Proxy) (*IPLocation, error) {
+	client := st.createClient(proxy, 10*time.Second)
+	resp, err := client.Get("http://ip-api.com/json?fields=country,countryCode")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get location")
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var location IPLocation
+	if err := json.Unmarshal(body, &location); err != nil {
+		return nil, err
+	}
+	return &location, nil
 }
